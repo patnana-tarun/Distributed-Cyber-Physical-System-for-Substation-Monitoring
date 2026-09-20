@@ -1,6 +1,6 @@
 #define BLYNK_PRINT Serial
-#define BLYNK_TEMPLATE_ID "TMPL3C-TXmwXy"
-#define BLYNK_TEMPLATE_NAME "CPS"
+#define BLYNK_TEMPLATE_ID "REPLACE_WITH_BLYNK_TEMPLATE_ID"
+#define BLYNK_TEMPLATE_NAME "REPLACE_WITH_BLYNK_TEMPLATE_NAME"
 #define BLYNK_AUTH_TOKEN "REPLACE_WITH_BLYNK_AUTH_TOKEN"
 
 #include <WiFi.h>
@@ -17,8 +17,6 @@ char pass[] = "REPLACE_WITH_WIFI_PASSWORD";
 #define IN4 12
 #define ENA 25
 #define ENB 33
-
-// ✅ No channel defines needed — v3.x assigns them automatically
 
 // ── Ultrasonic ─────────────────────────────────────────
 #define TRIG_PIN 5
@@ -42,7 +40,6 @@ unsigned long lastPingTime = 0;
 Servo myServo;
 
 // ── Motor PWM ──────────────────────────────────────────
-// ✅ v3.x: ledcWrite takes PIN, not channel
 void setMotorPWM(int a, int b) {
   ledcWrite(ENA, a);
   ledcWrite(ENB, b);
@@ -132,7 +129,6 @@ void setup() {
   pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
   pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
 
-  // ✅ v3.x: single function replaces ledcSetup + ledcAttachPin
   ledcAttach(ENA, 1000, 8);   // pin, freq, resolution
   ledcAttach(ENB, 1000, 8);
   stopMotors();
