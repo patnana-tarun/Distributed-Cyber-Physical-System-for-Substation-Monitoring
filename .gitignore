@@ -1,0 +1,21 @@
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
+secrets/
+*.local
+
+# Build and tool output
+build/
+dist/
+out/
+.pio/
+.vscode/
+*.elf
+*.hex
+*.bin
+*.uf2
+
+# Operating-system files
+.DS_Store
+Thumbs.db

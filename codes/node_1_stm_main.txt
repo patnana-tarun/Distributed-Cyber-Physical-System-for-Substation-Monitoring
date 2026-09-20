@@ -1,0 +1,757 @@
+#include "main.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+/* ═══════════════════════════════════════════════
+   CONFIG
+═══════════════════════════════════════════════ */
+#define OLED_ADDR      (0x3C << 1)
+#define OLED_WIDTH      128
+#define OLED_HEIGHT      64
+
+#define DHT_PORT        GPIOA
+#define DHT1_PIN        GPIO_PIN_1
+#define DHT2_PIN        GPIO_PIN_0
+
+#define MQ_PORT         GPIOA
+#define MQ_PIN          GPIO_PIN_5
+#define ACS_PIN         GPIO_PIN_6
+#define VOLT_PIN        GPIO_PIN_7
+#define MQ_CHANNEL      ADC_CHANNEL_5
+#define ACS_CHANNEL     ADC_CHANNEL_6
+#define VOLT_CHANNEL    ADC_CHANNEL_7
+
+#define RELAY_PORT      GPIOB
+#define RELAY_PIN       GPIO_PIN_0
+#define BUTTON_PORT     GPIOB
+#define BUTTON_PIN      GPIO_PIN_1
+
+#define RX_BUFFER_SIZE  150
+
+/* ═══════════════════════════════════════════════
+   DISPLAY MODES
+═══════════════════════════════════════════════ */
+#define DISPLAY_MODE_DASHBOARD  0
+#define DISPLAY_MODE_SENSORS    1
+#define DISPLAY_MODE_GRAPH      2
+#define DISPLAY_MODE_STATUS     3
+#define DISPLAY_MODE_COUNT      4
+
+/* ═══════════════════════════════════════════════
+   HANDLES  — single declaration, no duplicates
+═══════════════════════════════════════════════ */
+I2C_HandleTypeDef  hi2c1;
+TIM_HandleTypeDef  htim2;
+ADC_HandleTypeDef  hadc1;
+UART_HandleTypeDef huart1;
+
+/* ═══════════════════════════════════════════════
+   UART RX  — interrupt-driven only
+   ✅ Single volatile byte consumed in callback
+═══════════════════════════════════════════════ */
+volatile uint8_t  uart_rx_byte  = 0;   /* raw ISR byte        */
+char              rx_buffer[RX_BUFFER_SIZE];
+volatile uint8_t  rx_index      = 0;
+volatile uint8_t  cmd_ready     = 0;   /* flag: line complete */
+char              cmd_buf[RX_BUFFER_SIZE]; /* snapshot for main   */
+
+/* ═══════════════════════════════════════════════
+   OLED BUFFER & FONT
+═══════════════════════════════════════════════ */
+uint8_t oled_buffer[OLED_WIDTH * OLED_HEIGHT / 8];
+const uint8_t font5x7[][5] = {
+#include "font5x7.inc"
+};
+
+/* ═══════════════════════════════════════════════
+   SENSOR GLOBALS
+═══════════════════════════════════════════════ */
+float   threshold_voltage = 2.0f, threshold_current = 2.0f;
+float   threshold_mq      = 2.5f;
+float   threshold_temp1   = 35.0f, threshold_hum1 = 80.0f;
+float   threshold_temp2   = 35.0f, threshold_hum2 = 80.0f;
+
+float   temp1 = 0, hum1 = 0, temp2 = 0, hum2 = 0;
+float   mq_voltage = 0, current_reading = 0, voltage_reading = 0;
+uint8_t dht1_status = 1, dht2_status = 1;
+
+uint8_t  display_mode       = DISPLAY_MODE_DASHBOARD;
+uint8_t  animation_frame    = 0;
+float    voltage_history[128] = {0};
+uint8_t  history_index      = 0;
+uint32_t last_display_update = 0;
+uint8_t  auto_cycle_paused  = 0;
+uint32_t last_button_press  = 0;
+
+/* ═══════════════════════════════════════════════
+   PROTOTYPES
+═══════════════════════════════════════════════ */
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_USART1_UART_Init(void);
+
+/* ✅ uart_send is safe to call ONLY from main context */
+static void uart_send(const char *msg);
+void Process_Command(char *cmd);
+
+void Read_All_Sensors(void);
+void Check_Thresholds(void);
+void Send_Telemetry(void);
+
+uint16_t ADC_Read(uint32_t channel);
+void     delay_us(uint16_t us);
+uint8_t  DHT_Read(uint16_t pin, float *temp, float *hum);
+
+void OLED_Command(uint8_t cmd);
+void OLED_Data(uint8_t *data, uint16_t size);
+void OLED_Init(void);
+void OLED_Clear(void);
+void OLED_Update(void);
+void OLED_DrawChar(uint8_t page, uint8_t col, char ch);
+void OLED_WriteString(uint8_t page, uint8_t col, char *str);
+void OLED_DrawPixel(uint8_t x, uint8_t y, uint8_t color);
+void OLED_DrawLine(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1);
+void OLED_DrawRect(uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint8_t fill);
+void OLED_DrawCircle(uint8_t x0, uint8_t y0, uint8_t r);
+void OLED_DrawProgressBar(uint8_t x, uint8_t y, uint8_t w, uint8_t h, float percent);
+void OLED_DrawGraph(uint8_t x, uint8_t y, uint8_t w, uint8_t h, float *data, uint8_t len);
+
+void Display_Dashboard(void);
+void Display_Sensors(void);
+void Display_Graph(void);
+void Display_Status(void);
+void Update_Display(void);
+void Error_Handler(void);
+
+/* ═══════════════════════════════════════════════
+   ICONS
+═══════════════════════════════════════════════ */
+const uint8_t icon_temp[]    = {0x0C,0x12,0x12,0x12,0x1E,0x3F,0x3F,0x1E};
+const uint8_t icon_humid[]   = {0x08,0x1C,0x1C,0x3E,0x3E,0x7F,0x7F,0x3E};
+const uint8_t icon_voltage[] = {0x18,0x1C,0x0E,0x07,0x0E,0x1C,0x18,0x00};
+const uint8_t icon_gas[]     = {0x1C,0x22,0x55,0x49,0x55,0x22,0x1C,0x00};
+
+/* ═══════════════════════════════════════════════
+   UART RX COMPLETE CALLBACK
+   ✅ ISR-safe: only sets a flag, never calls
+      uart_send() or any blocking function
+═══════════════════════════════════════════════ */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        uint8_t c = uart_rx_byte;
+
+        if (c == '\n' || c == '\r')
+        {
+            rx_buffer[rx_index] = '\0';
+            if (rx_index > 0)
+            {
+                /* Snapshot into cmd_buf and raise flag for main loop */
+                strncpy(cmd_buf, rx_buffer, RX_BUFFER_SIZE);
+                cmd_ready = 1;
+            }
+            rx_index = 0;
+        }
+        else if (c == 0x08 || c == 0x7F)   /* backspace */
+        {
+            if (rx_index > 0) rx_index--;
+        }
+        else if (rx_index < RX_BUFFER_SIZE - 2)
+        {
+            rx_buffer[rx_index++] = c;
+        }
+        else
+        {
+            rx_index = 0;   /* overflow — silently reset */
+        }
+
+        /* Re-arm for next byte */
+        HAL_UART_Receive_IT(&huart1, (uint8_t *)&uart_rx_byte, 1);
+    }
+}
+
+/* ═══════════════════════════════════════════════
+   MAIN
+═══════════════════════════════════════════════ */
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_I2C1_Init();
+    MX_TIM2_Init();
+    MX_ADC1_Init();
+    MX_USART1_UART_Init();
+
+    HAL_TIM_Base_Start(&htim2);
+    OLED_Init();
+    HAL_GPIO_WritePin(RELAY_PORT, RELAY_PIN, GPIO_PIN_RESET);
+
+    /* ✅ Safe: uart_send called from main context only */
+    uart_send("=== SYSTEM READY ===\r\n");
+    uart_send("Type HELP for commands\r\n> ");
+
+    /* Arm UART interrupt — single place, never called again */
+    HAL_UART_Receive_IT(&huart1, (uint8_t *)&uart_rx_byte, 1);
+
+    uint32_t last_dht_read    = 0;
+    uint32_t last_telemetry   = 0;
+    uint32_t last_mode_switch = 0;
+
+    while (1)
+    {
+        uint32_t now = HAL_GetTick();
+
+        /* ── Button debounce ── */
+        if (HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN) == GPIO_PIN_RESET)
+        {
+            if ((now - last_button_press) > 300)
+            {
+                auto_cycle_paused = !auto_cycle_paused;
+                last_button_press = now;
+            }
+        }
+
+        /* ── DHT every 2 s ── */
+        if ((now - last_dht_read) >= 2000)
+        {
+            dht1_status = DHT_Read(DHT1_PIN, &temp1, &hum1);
+            HAL_Delay(50);
+            dht2_status = DHT_Read(DHT2_PIN, &temp2, &hum2);
+            last_dht_read = now;
+        }
+
+        /* ── Analog + telemetry every 1 s ── */
+        if ((now - last_telemetry) >= 1000)
+        {
+            Read_All_Sensors();
+            Check_Thresholds();
+            Send_Telemetry();
+            voltage_history[history_index] = voltage_reading;
+            history_index = (history_index + 1) % 128;
+            last_telemetry = now;
+        }
+
+        /* ── Auto-cycle display ── */
+        if (!auto_cycle_paused && (now - last_mode_switch) >= 5000)
+        {
+            display_mode     = (display_mode + 1) % DISPLAY_MODE_COUNT;
+            last_mode_switch = now;
+        }
+
+        /* ── Display at 10 Hz ── */
+        if ((now - last_display_update) >= 100)
+        {
+            Update_Display();
+            animation_frame++;
+            last_display_update = now;
+        }
+
+        /* ── ✅ Process command in MAIN context (never in ISR) ── */
+        if (cmd_ready)
+        {
+            cmd_ready = 0;
+            uart_send("\r\n");
+            Process_Command(cmd_buf);
+            uart_send("> ");
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════
+   COMMAND PARSER
+   ✅ Called only from main loop — blocking TX is safe here
+═══════════════════════════════════════════════ */
+void Process_Command(char *cmd)
+{
+    char response[200];
+
+    if      (strcmp(cmd, "DISP:DASH")  == 0)
+    { display_mode = DISPLAY_MODE_DASHBOARD; uart_send("ACK:DISPLAY_DASHBOARD\r\n"); }
+    else if (strcmp(cmd, "DISP:SENS")  == 0)
+    { display_mode = DISPLAY_MODE_SENSORS;   uart_send("ACK:DISPLAY_SENSORS\r\n");   }
+    else if (strcmp(cmd, "DISP:GRAPH") == 0)
+    { display_mode = DISPLAY_MODE_GRAPH;     uart_send("ACK:DISPLAY_GRAPH\r\n");     }
+    else if (strcmp(cmd, "DISP:STAT")  == 0)
+    { display_mode = DISPLAY_MODE_STATUS;    uart_send("ACK:DISPLAY_STATUS\r\n");    }
+
+    else if (strcmp(cmd, "RELAY:ON")  == 0)
+    { HAL_GPIO_WritePin(RELAY_PORT, RELAY_PIN, GPIO_PIN_SET);   uart_send("ACK:RELAY_ON\r\n");  }
+    else if (strcmp(cmd, "RELAY:OFF") == 0)
+    { HAL_GPIO_WritePin(RELAY_PORT, RELAY_PIN, GPIO_PIN_RESET); uart_send("ACK:RELAY_OFF\r\n"); }
+
+    else if (strncmp(cmd, "SET:", 4) == 0)
+    {
+        float v, ci, mq, t1, h1, t2, h2;
+        int parsed = sscanf(cmd,
+                     "SET:V=%f,I=%f,MQ=%f,T1=%f,H1=%f,T2=%f,H2=%f",
+                     &v, &ci, &mq, &t1, &h1, &t2, &h2);
+        if (parsed >= 3)
+        {
+            if (v  >= 0   && v  <= 100) threshold_voltage = v;
+            if (ci >= 0   && ci <= 10)  threshold_current = ci;
+            if (mq >= 0   && mq <= 5)   threshold_mq      = mq;
+            if (parsed >= 5) { threshold_temp1 = t1; threshold_hum1 = h1; }
+            if (parsed >= 7) { threshold_temp2 = t2; threshold_hum2 = h2; }
+            snprintf(response, sizeof(response),
+                     "ACK:SET V=%.1f I=%.1f MQ=%.1f T1=%.1f H1=%.0f T2=%.1f H2=%.0f\r\n",
+                     threshold_voltage, threshold_current, threshold_mq,
+                     threshold_temp1, threshold_hum1, threshold_temp2, threshold_hum2);
+            uart_send(response);
+        }
+        else
+            uart_send("ERROR:INVALID_SET\r\n");
+    }
+
+    else if (strcmp(cmd, "STATUS") == 0)
+    {
+        snprintf(response, sizeof(response),
+                 "STATUS:V=%.1f,I=%.1f,MQ=%.1f,T1=%.1f,H1=%.0f,T2=%.1f,H2=%.0f,RELAY=%d\r\n",
+                 threshold_voltage, threshold_current, threshold_mq,
+                 threshold_temp1, threshold_hum1, threshold_temp2, threshold_hum2,
+                 HAL_GPIO_ReadPin(RELAY_PORT, RELAY_PIN));
+        uart_send(response);
+    }
+    else if (strcmp(cmd, "READ") == 0)
+    {
+        snprintf(response, sizeof(response),
+                 "READ:MQ=%.2f,I=%.2f,V=%.2f,T1=%.1f,H1=%.0f,T2=%.1f,H2=%.0f\r\n",
+                 mq_voltage, current_reading, voltage_reading,
+                 temp1, hum1, temp2, hum2);
+        uart_send(response);
+    }
+    else if (strcmp(cmd, "HELP") == 0)
+    {
+        uart_send("--- Commands ---\r\n");
+        uart_send("  DISP:DASH / DISP:SENS / DISP:GRAPH / DISP:STAT\r\n");
+        uart_send("  RELAY:ON  / RELAY:OFF\r\n");
+        uart_send("  SET:V=x,I=x,MQ=x,T1=x,H1=x,T2=x,H2=x\r\n");
+        uart_send("  STATUS  /  READ\r\n");
+        uart_send("----------------\r\n");
+    }
+    else
+    {
+        snprintf(response, sizeof(response),
+                 "ERROR:UNKNOWN_CMD [%s]\r\n", cmd);
+        uart_send(response);
+    }
+}
+
+/* ═══════════════════════════════════════════════
+   SENSOR FUNCTIONS
+═══════════════════════════════════════════════ */
+void Read_All_Sensors(void)
+{
+    mq_voltage = (3.3f * ADC_Read(MQ_CHANNEL))   / 4095.0f;
+    float v_adc = (3.3f * ADC_Read(ACS_CHANNEL)) / 4095.0f;
+    current_reading = (v_adc - 2.5f) / 0.185f;
+    if (current_reading < 0.0f) current_reading = 0.0f;
+    float v_div = (3.3f * ADC_Read(VOLT_CHANNEL)) / 4095.0f;
+    voltage_reading = v_div * 5.0f;
+}
+
+void Check_Thresholds(void)
+{
+    uint8_t alarm = 0;
+    if (voltage_reading > threshold_voltage) alarm = 1;
+    if (current_reading > threshold_current) alarm = 1;
+    if (mq_voltage      > threshold_mq)      alarm = 1;
+    if (dht1_status == 0 && temp1 > threshold_temp1) alarm = 1;
+    if (dht1_status == 0 && hum1  > threshold_hum1)  alarm = 1;
+    if (dht2_status == 0 && temp2 > threshold_temp2) alarm = 1;
+    if (dht2_status == 0 && hum2  > threshold_hum2)  alarm = 1;
+    HAL_GPIO_WritePin(RELAY_PORT, RELAY_PIN,
+                      alarm ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+void Send_Telemetry(void)
+{
+    char tx_msg[250];
+    snprintf(tx_msg, sizeof(tx_msg),
+             "DATA:MQ=%.2f,I=%.2f,V=%.2f,"
+             "T1=%.1f,H1=%.0f,T2=%.1f,H2=%.0f,"
+             "D1=%s,D2=%s,RELAY=%d\r\n",
+             mq_voltage, current_reading, voltage_reading,
+             (dht1_status == 0) ? temp1 : 0.0f,
+             (dht1_status == 0) ? hum1  : 0.0f,
+             (dht2_status == 0) ? temp2 : 0.0f,
+             (dht2_status == 0) ? hum2  : 0.0f,
+             (dht1_status == 0) ? "OK"  : "ERR",
+             (dht2_status == 0) ? "OK"  : "ERR",
+             HAL_GPIO_ReadPin(RELAY_PORT, RELAY_PIN));
+    uart_send(tx_msg);
+}
+
+/* ═══════════════════════════════════════════════
+   DISPLAY FUNCTIONS
+═══════════════════════════════════════════════ */
+void Update_Display(void)
+{
+    OLED_Clear();
+    switch (display_mode)
+    {
+        case DISPLAY_MODE_DASHBOARD: Display_Dashboard(); break;
+        case DISPLAY_MODE_SENSORS:   Display_Sensors();   break;
+        case DISPLAY_MODE_GRAPH:     Display_Graph();     break;
+        case DISPLAY_MODE_STATUS:    Display_Status();    break;
+    }
+    OLED_Update();
+}
+
+void Display_Dashboard(void)
+{
+    char buf[25];
+    uint8_t pulse = (animation_frame % 20) < 10 ? 1 : 0;
+    OLED_DrawRect(0, 0, 128, 11, 1);
+    OLED_WriteString(0, 10, "SYSTEM MONITOR");
+    if (HAL_GPIO_ReadPin(RELAY_PORT, RELAY_PIN))
+    { if (pulse) OLED_DrawCircle(118, 5, 3); OLED_WriteString(0, 90, "ALRT"); }
+    else OLED_DrawCircle(118, 5, 2);
+
+    OLED_WriteString(2, 4, "T1:");
+    snprintf(buf, sizeof(buf), "%.1fC", (dht1_status == 0) ? temp1 : 0.0f);
+    OLED_WriteString(2, 28, buf);
+
+    OLED_WriteString(2, 70, "T2:");
+    snprintf(buf, sizeof(buf), "%.1fC", (dht2_status == 0) ? temp2 : 0.0f);
+    OLED_WriteString(2, 94, buf);
+
+    snprintf(buf, sizeof(buf), "V:%.2f A:%.2f", voltage_reading, current_reading);
+    OLED_WriteString(3, 4, buf);
+    snprintf(buf, sizeof(buf), "GAS:%.2fV", mq_voltage);
+    OLED_WriteString(4, 4, buf);
+
+    OLED_DrawLine(0, 52, 127, 52);
+    OLED_WriteString(6, 4,  (dht1_status == 0) ? "D1:OK" : "D1:ER");
+    OLED_WriteString(6, 44, (dht2_status == 0) ? "D2:OK" : "D2:ER");
+    OLED_WriteString(6, 88, HAL_GPIO_ReadPin(RELAY_PORT, RELAY_PIN) ? "RLY:ON" : "RLY:OF");
+}
+
+void Display_Sensors(void)
+{
+    char buf[30];
+    OLED_WriteString(0, 10, "SENSOR READINGS");
+    OLED_DrawLine(0, 10, 127, 10);
+    if (dht1_status == 0)
+    { snprintf(buf, sizeof(buf), "T1:%.1fC H1:%.0f%%", temp1, hum1); OLED_WriteString(2, 4, buf); }
+    else OLED_WriteString(2, 4, "DHT1: ERROR");
+    OLED_DrawLine(0, 26, 127, 26);
+    if (dht2_status == 0)
+    { snprintf(buf, sizeof(buf), "T2:%.1fC H2:%.0f%%", temp2, hum2); OLED_WriteString(3, 4, buf); }
+    else OLED_WriteString(3, 4, "DHT2: ERROR");
+    OLED_DrawLine(0, 38, 127, 38);
+    snprintf(buf, sizeof(buf), "VOLT: %.2f V", voltage_reading); OLED_WriteString(4, 4, buf);
+    snprintf(buf, sizeof(buf), "CURR: %.2f A", current_reading); OLED_WriteString(5, 4, buf);
+    snprintf(buf, sizeof(buf), "GAS:  %.2f V", mq_voltage);     OLED_WriteString(6, 4, buf);
+}
+
+void Display_Graph(void)
+{
+    char buf[20];
+    OLED_WriteString(0, 10, "VOLTAGE HISTORY");
+    OLED_DrawLine(0, 10, 127, 10);
+    OLED_DrawGraph(4, 14, 120, 46, voltage_history, 120);
+    snprintf(buf, sizeof(buf), "%.2fV", voltage_reading);  OLED_WriteString(7, 40, buf);
+    snprintf(buf, sizeof(buf), "Th:%.1f", threshold_voltage); OLED_WriteString(7, 80, buf);
+}
+
+void Display_Status(void)
+{
+    char buf[30];
+    uint8_t violations = 0;
+    OLED_WriteString(0, 15, "SYSTEM STATUS");
+    OLED_DrawLine(0, 10, 127, 10);
+    OLED_WriteString(2, 4, "RELAY:");
+    OLED_WriteString(2, 46, HAL_GPIO_ReadPin(RELAY_PORT, RELAY_PIN) ? "ON" : "OFF");
+    OLED_DrawLine(0, 28, 127, 28);
+    OLED_WriteString(3, 4, "SENSORS:");
+    if (dht1_status == 0 && dht2_status == 0) OLED_WriteString(4, 4, "ALL OK");
+    else
+    {
+        if (dht1_status != 0) OLED_WriteString(4, 4, "DHT1 ERR");
+        if (dht2_status != 0) OLED_WriteString(5, 4, "DHT2 ERR");
+    }
+    OLED_DrawLine(0, 52, 127, 52);
+    if (voltage_reading > threshold_voltage) violations++;
+    if (current_reading > threshold_current) violations++;
+    if (mq_voltage      > threshold_mq)      violations++;
+    if (dht1_status == 0 && temp1 > threshold_temp1) violations++;
+    if (dht2_status == 0 && temp2 > threshold_temp2) violations++;
+    if (violations > 0)
+    { snprintf(buf, sizeof(buf), "%d ALERTS", violations); OLED_WriteString(7, 4, buf); }
+    else OLED_WriteString(7, 4, "NO ALERTS");
+}
+
+/* ═══════════════════════════════════════════════
+   OLED DRAWING
+═══════════════════════════════════════════════ */
+void OLED_DrawPixel(uint8_t x, uint8_t y, uint8_t color)
+{
+    if (x >= OLED_WIDTH || y >= OLED_HEIGHT) return;
+    uint16_t idx = (y / 8) * OLED_WIDTH + x;
+    if (color) oled_buffer[idx] |=  (1 << (y % 8));
+    else       oled_buffer[idx] &= ~(1 << (y % 8));
+}
+
+void OLED_DrawLine(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1)
+{
+    int16_t dx = abs(x1-x0), dy = abs(y1-y0);
+    int16_t sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx - dy;
+    while (1)
+    {
+        OLED_DrawPixel(x0, y0, 1);
+        if (x0 == x1 && y0 == y1) break;
+        int16_t e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 <  dx) { err += dx; y0 += sy; }
+    }
+}
+
+void OLED_DrawRect(uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint8_t fill)
+{
+    if (fill) { for (uint8_t i = 0; i < h; i++) OLED_DrawLine(x, y+i, x+w-1, y+i); }
+    else
+    {
+        OLED_DrawLine(x, y, x+w-1, y);       OLED_DrawLine(x, y+h-1, x+w-1, y+h-1);
+        OLED_DrawLine(x, y, x, y+h-1);       OLED_DrawLine(x+w-1, y, x+w-1, y+h-1);
+    }
+}
+
+void OLED_DrawCircle(uint8_t x0, uint8_t y0, uint8_t r)
+{
+    int16_t f = 1-r, ddx = 1, ddy = -2*r, x = 0, y = r;
+    OLED_DrawPixel(x0, y0+r, 1); OLED_DrawPixel(x0, y0-r, 1);
+    OLED_DrawPixel(x0+r, y0, 1); OLED_DrawPixel(x0-r, y0, 1);
+    while (x < y)
+    {
+        if (f >= 0) { y--; ddy += 2; f += ddy; }
+        x++; ddx += 2; f += ddx;
+        OLED_DrawPixel(x0+x, y0+y, 1); OLED_DrawPixel(x0-x, y0+y, 1);
+        OLED_DrawPixel(x0+x, y0-y, 1); OLED_DrawPixel(x0-x, y0-y, 1);
+        OLED_DrawPixel(x0+y, y0+x, 1); OLED_DrawPixel(x0-y, y0+x, 1);
+        OLED_DrawPixel(x0+y, y0-x, 1); OLED_DrawPixel(x0-y, y0-x, 1);
+    }
+}
+
+void OLED_DrawProgressBar(uint8_t x, uint8_t y, uint8_t w, uint8_t h, float pct)
+{
+    if (pct > 100.0f) pct = 100.0f;
+    if (pct <   0.0f) pct =   0.0f;
+    OLED_DrawRect(x, y, w, h, 0);
+    uint8_t fw = (uint8_t)((w - 2) * pct / 100.0f);
+    if (fw > 0) OLED_DrawRect(x+1, y+1, fw, h-2, 1);
+}
+
+void OLED_DrawGraph(uint8_t x, uint8_t y, uint8_t w, uint8_t h, float *data, uint8_t len)
+{
+    if (len == 0) return;
+    OLED_DrawRect(x, y, w, h, 0);
+    float mn = data[0], mx = data[0];
+    for (uint8_t i = 1; i < len; i++) { if (data[i] < mn) mn = data[i]; if (data[i] > mx) mx = data[i]; }
+    float range = mx - mn; if (range < 0.1f) range = 0.1f;
+    for (uint8_t i = 1; i < len && i < (uint8_t)(w-2); i++)
+    {
+        uint8_t y1 = y+h-2-(uint8_t)((data[i-1]-mn)/range*(h-4));
+        uint8_t y2 = y+h-2-(uint8_t)((data[i]  -mn)/range*(h-4));
+        OLED_DrawLine(x+i, y1, x+i+1, y2);
+    }
+}
+
+/* ═══════════════════════════════════════════════
+   OLED CORE
+═══════════════════════════════════════════════ */
+void OLED_Command(uint8_t cmd) { uint8_t d[2]={0x00,cmd}; HAL_I2C_Master_Transmit(&hi2c1, OLED_ADDR, d, 2, 100); }
+void OLED_Data(uint8_t *data, uint16_t size)
+{
+    uint8_t tmp[129]; tmp[0]=0x40; memcpy(&tmp[1], data, size);
+    HAL_I2C_Master_Transmit(&hi2c1, OLED_ADDR, tmp, size+1, 100);
+}
+void OLED_Clear(void)  { memset(oled_buffer, 0, sizeof(oled_buffer)); }
+void OLED_Update(void) { for (uint8_t i=0; i<8; i++) { OLED_Command(0xB0+i); OLED_Command(0x00); OLED_Command(0x10); OLED_Data(&oled_buffer[i*128], 128); } }
+void OLED_Init(void)
+{
+    HAL_Delay(100);
+    OLED_Command(0xAE); OLED_Command(0x20); OLED_Command(0x00);
+    OLED_Command(0xB0); OLED_Command(0xC8); OLED_Command(0x00); OLED_Command(0x10);
+    OLED_Command(0x40); OLED_Command(0x81); OLED_Command(0xFF);
+    OLED_Command(0xA1); OLED_Command(0xA6); OLED_Command(0xA8); OLED_Command(0x3F);
+    OLED_Command(0xA4); OLED_Command(0xD3); OLED_Command(0x00);
+    OLED_Command(0xD5); OLED_Command(0xF0); OLED_Command(0xD9); OLED_Command(0x22);
+    OLED_Command(0xDA); OLED_Command(0x12); OLED_Command(0xDB); OLED_Command(0x20);
+    OLED_Command(0x8D); OLED_Command(0x14); OLED_Command(0xAF);
+    OLED_Clear(); OLED_Update();
+}
+
+void OLED_DrawChar(uint8_t page, uint8_t col, char ch)
+{
+    if (col >= OLED_WIDTH - 6) return;
+    uint8_t c = ch - 32; if (c > 95) c = 0;
+    uint16_t off = page * 128 + col;
+    for (uint8_t i = 0; i < 5; i++) oled_buffer[off+i] = font5x7[c][i];
+    oled_buffer[off+5] = 0x00;
+}
+
+void OLED_WriteString(uint8_t page, uint8_t col, char *str)
+{
+    while (*str && col < (OLED_WIDTH - 6)) { OLED_DrawChar(page, col, *str++); col += 6; }
+}
+
+/* ═══════════════════════════════════════════════
+   ADC
+═══════════════════════════════════════════════ */
+uint16_t ADC_Read(uint32_t channel)
+{
+    ADC_ChannelConfTypeDef s = {0};
+    s.Channel = channel; s.Rank = 1; s.SamplingTime = ADC_SAMPLETIME_480CYCLES;
+    if (HAL_ADC_ConfigChannel(&hadc1, &s) != HAL_OK) return 0;
+    HAL_ADC_Start(&hadc1);
+    if (HAL_ADC_PollForConversion(&hadc1, 100) != HAL_OK) { HAL_ADC_Stop(&hadc1); return 0; }
+    uint16_t v = HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+    return v;
+}
+
+/* ═══════════════════════════════════════════════
+   MICROSECOND DELAY
+═══════════════════════════════════════════════ */
+void delay_us(uint16_t us)
+{
+    __HAL_TIM_SET_COUNTER(&htim2, 0);
+    while (__HAL_TIM_GET_COUNTER(&htim2) < us);
+}
+
+/* ═══════════════════════════════════════════════
+   DHT11
+═══════════════════════════════════════════════ */
+uint8_t DHT_Read(uint16_t pin, float *temp, float *hum)
+{
+    uint8_t data[5] = {0};
+    GPIO_InitTypeDef g = {0};
+    g.Pin = pin; g.Mode = GPIO_MODE_OUTPUT_PP; g.Pull = GPIO_NOPULL; g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(DHT_PORT, &g);
+    HAL_GPIO_WritePin(DHT_PORT, pin, GPIO_PIN_RESET); HAL_Delay(18);
+    HAL_GPIO_WritePin(DHT_PORT, pin, GPIO_PIN_SET);   delay_us(20);
+    g.Mode = GPIO_MODE_INPUT; g.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(DHT_PORT, &g);
+    uint32_t t;
+    t=100; while( HAL_GPIO_ReadPin(DHT_PORT,pin) && t--) delay_us(1); if(!t) return 1;
+    t=100; while(!HAL_GPIO_ReadPin(DHT_PORT,pin) && t--) delay_us(1); if(!t) return 1;
+    t=100; while( HAL_GPIO_ReadPin(DHT_PORT,pin) && t--) delay_us(1); if(!t) return 1;
+    for (int b = 0; b < 40; b++)
+    {
+        t=100; while(!HAL_GPIO_ReadPin(DHT_PORT,pin) && t--) delay_us(1); if(!t) return 1;
+        delay_us(30);
+        if (HAL_GPIO_ReadPin(DHT_PORT, pin)) data[b/8] |= (1 << (7-(b%8)));
+        t=100; while(HAL_GPIO_ReadPin(DHT_PORT,pin) && t--) delay_us(1);
+    }
+    if ((uint8_t)(data[0]+data[1]+data[2]+data[3]) != data[4]) return 1;
+    *hum = (float)data[0]; *temp = (float)data[2];
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════
+   PERIPHERAL INIT
+═══════════════════════════════════════════════ */
+static void MX_USART1_UART_Init(void)
+{
+    __HAL_RCC_USART1_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    GPIO_InitTypeDef g = {0};
+    g.Pin = GPIO_PIN_9 | GPIO_PIN_10; g.Mode = GPIO_MODE_AF_PP;
+    g.Pull = GPIO_PULLUP; g.Speed = GPIO_SPEED_FREQ_VERY_HIGH; g.Alternate = GPIO_AF7_USART1;
+    HAL_GPIO_Init(GPIOA, &g);
+    huart1.Instance = USART1; huart1.Init.BaudRate = 9600;
+    huart1.Init.WordLength = UART_WORDLENGTH_8B; huart1.Init.StopBits = UART_STOPBITS_1;
+    huart1.Init.Parity = UART_PARITY_NONE; huart1.Init.Mode = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE; huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+    if (HAL_UART_Init(&huart1) != HAL_OK) Error_Handler();
+    HAL_NVIC_SetPriority(USART1_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(USART1_IRQn);
+}
+
+static void MX_GPIO_Init(void)
+{
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    GPIO_InitTypeDef g = {0};
+    g.Pin = RELAY_PIN; g.Mode = GPIO_MODE_OUTPUT_PP; g.Pull = GPIO_NOPULL; g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(RELAY_PORT, &g);
+    HAL_GPIO_WritePin(RELAY_PORT, RELAY_PIN, GPIO_PIN_RESET);
+    g.Pin = BUTTON_PIN; g.Mode = GPIO_MODE_INPUT; g.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(BUTTON_PORT, &g);
+}
+
+static void MX_TIM2_Init(void)
+{
+    __HAL_RCC_TIM2_CLK_ENABLE();
+    htim2.Instance = TIM2; htim2.Init.Prescaler = 84-1;
+    htim2.Init.CounterMode = TIM_COUNTERMODE_UP; htim2.Init.Period = 0xFFFFFFFF;
+    htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    HAL_TIM_Base_Init(&htim2);
+}
+
+static void MX_ADC1_Init(void)
+{
+    __HAL_RCC_ADC1_CLK_ENABLE();
+    GPIO_InitTypeDef g = {0};
+    g.Pin = MQ_PIN | ACS_PIN | VOLT_PIN; g.Mode = GPIO_MODE_ANALOG; g.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(MQ_PORT, &g);
+    hadc1.Instance = ADC1; hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+    hadc1.Init.Resolution = ADC_RESOLUTION_12B; hadc1.Init.ScanConvMode = DISABLE;
+    hadc1.Init.ContinuousConvMode = DISABLE; hadc1.Init.DiscontinuousConvMode = DISABLE;
+    hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+    hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START; hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+    hadc1.Init.NbrOfConversion = 1; hadc1.Init.DMAContinuousRequests = DISABLE;
+    hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+    if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler();
+}
+
+static void MX_I2C1_Init(void)
+{
+    __HAL_RCC_I2C1_CLK_ENABLE();
+    GPIO_InitTypeDef g = {0};
+    g.Pin = GPIO_PIN_8 | GPIO_PIN_9; g.Mode = GPIO_MODE_AF_OD;
+    g.Pull = GPIO_PULLUP; g.Speed = GPIO_SPEED_FREQ_VERY_HIGH; g.Alternate = GPIO_AF4_I2C1;
+    HAL_GPIO_Init(GPIOB, &g);
+    hi2c1.Instance = I2C1; hi2c1.Init.ClockSpeed = 100000; hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+    hi2c1.Init.OwnAddress1 = 0; hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE; hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+    HAL_I2C_Init(&hi2c1);
+}
+
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef osc = {0}; RCC_ClkInitTypeDef clk = {0};
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
+    osc.OscillatorType = RCC_OSCILLATORTYPE_HSI; osc.HSIState = RCC_HSI_ON;
+    osc.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT; osc.PLL.PLLState = RCC_PLL_ON;
+    osc.PLL.PLLSource = RCC_PLLSOURCE_HSI; osc.PLL.PLLM = 16; osc.PLL.PLLN = 336;
+    osc.PLL.PLLP = RCC_PLLP_DIV4; osc.PLL.PLLQ = 7;
+    if (HAL_RCC_OscConfig(&osc) != HAL_OK) Error_Handler();
+    clk.ClockType = RCC_CLOCKTYPE_SYSCLK|RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+    clk.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK; clk.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    clk.APB1CLKDivider = RCC_HCLK_DIV2; clk.APB2CLKDivider = RCC_HCLK_DIV1;
+    if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_2) != HAL_OK) Error_Handler();
+}
+
+/* ═══════════════════════════════════════════════
+   HELPERS
+═══════════════════════════════════════════════ */
+static void uart_send(const char *msg)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+}
+
+void Error_Handler(void)
+{
+    while (1) { HAL_GPIO_TogglePin(RELAY_PORT, RELAY_PIN); HAL_Delay(200); }
+}
