@@ -49,7 +49,6 @@ UART_HandleTypeDef huart1;
 
 /* ═══════════════════════════════════════════════
    UART RX  — interrupt-driven only
-   ✅ Single volatile byte consumed in callback
 ═══════════════════════════════════════════════ */
 volatile uint8_t  uart_rx_byte  = 0;   /* raw ISR byte        */
 char              rx_buffer[RX_BUFFER_SIZE];
@@ -95,7 +94,7 @@ static void MX_TIM2_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_USART1_UART_Init(void);
 
-/* ✅ uart_send is safe to call ONLY from main context */
+/* uart_send is safe to call ONLY from main context */
 static void uart_send(const char *msg);
 void Process_Command(char *cmd);
 
@@ -138,7 +137,6 @@ const uint8_t icon_gas[]     = {0x1C,0x22,0x55,0x49,0x55,0x22,0x1C,0x00};
 
 /* ═══════════════════════════════════════════════
    UART RX COMPLETE CALLBACK
-   ✅ ISR-safe: only sets a flag, never calls
       uart_send() or any blocking function
 ═══════════════════════════════════════════════ */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
@@ -193,7 +191,6 @@ int main(void)
     OLED_Init();
     HAL_GPIO_WritePin(RELAY_PORT, RELAY_PIN, GPIO_PIN_RESET);
 
-    /* ✅ Safe: uart_send called from main context only */
     uart_send("=== SYSTEM READY ===\r\n");
     uart_send("Type HELP for commands\r\n> ");
 
@@ -253,7 +250,7 @@ int main(void)
             last_display_update = now;
         }
 
-        /* ── ✅ Process command in MAIN context (never in ISR) ── */
+        /* ── Process command in MAIN context (never in ISR) ── */
         if (cmd_ready)
         {
             cmd_ready = 0;
@@ -266,7 +263,6 @@ int main(void)
 
 /* ═══════════════════════════════════════════════
    COMMAND PARSER
-   ✅ Called only from main loop — blocking TX is safe here
 ═══════════════════════════════════════════════ */
 void Process_Command(char *cmd)
 {
